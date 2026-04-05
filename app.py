@@ -11,6 +11,24 @@ st.set_page_config(
     layout="wide"
 )
 
+# ── PASSWORD PROTECTION ───────────────────────────────────────────────────────
+def check_password():
+    if "authenticated" not in st.session_state:
+        st.session_state.authenticated = False
+    if not st.session_state.authenticated:
+        st.title("💰 Budget Tracker")
+        st.markdown("---")
+        password = st.text_input("Enter password", type="password")
+        if st.button("Login"):
+            if password == st.secrets["PASSWORD"]:
+                st.session_state.authenticated = True
+                st.rerun()
+            else:
+                st.error("Incorrect password")
+        st.stop()
+
+check_password()
+
 # ── FILE PATHS ─────────────────────────────────────────────────────────────────
 DATA_DIR = "data"
 CREDIT_CSV = os.path.join(DATA_DIR, "credit.csv")
