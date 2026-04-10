@@ -73,21 +73,13 @@ def clean_for_sheets(df):
     return df
 
 def save_csv_to_sheet(tab_name, col_names, new_rows_df):
-    """Merge new rows into a sheet tab, deduplicating."""
+    """Append new rows to a sheet tab — no read, just append."""
     try:
         ws = get_sheet(tab_name)
-        existing = ws.get_all_values()
         new_clean = clean_for_sheets(new_rows_df)
-        if existing:
-            existing_df = pd.DataFrame(existing, columns=col_names[:len(existing[0])])
-            existing_clean = clean_for_sheets(existing_df)
-            merged = pd.concat([existing_clean, new_clean]).drop_duplicates()
-        else:
-            merged = new_clean
-        ws.clear()
-        data = merged.values.tolist()
+        data = new_clean.values.tolist()
         if data:
-            ws.update(data)
+            ws.append_rows(data, value_input_option="RAW")
     except Exception as e:
         st.error(f"Error saving to sheet: {e}")
 
@@ -394,7 +386,7 @@ def load_transactions():
     return transactions
 
 # ── LOAD STATE FROM GOOGLE SHEETS ─────────────────────────────────────────────
-@st.cache_data(ttl=30)
+@st.cache_data(ttl=120)
 def load_all_state():
     learned   = load_json_sheet("learned")
     confirmed = load_confirmed_sheet()
