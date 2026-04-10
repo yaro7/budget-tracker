@@ -63,18 +63,31 @@ def load_csv_from_sheet(tab_name, col_names):
     except Exception:
         return []
 
+def clean_for_sheets(df):
+    """Replace NaN, inf, empty with empty string so Sheets accepts it."""
+    df = df.copy()
+    df = df.fillna("")
+    df = df.replace([float("inf"), float("-inf")], "")
+    df = df.astype(str)
+    df = df.replace("nan", "").replace("None", "").replace("inf", "")
+    return df
+
 def save_csv_to_sheet(tab_name, col_names, new_rows_df):
     """Merge new rows into a sheet tab, deduplicating."""
     try:
         ws = get_sheet(tab_name)
         existing = ws.get_all_values()
+        new_clean = clean_for_sheets(new_rows_df)
         if existing:
             existing_df = pd.DataFrame(existing, columns=col_names[:len(existing[0])])
+            existing_clean = clean_for_sheets(existing_df)
+            merged = pd.concat([existing_clean, new_clean]).drop_duplicates()
         else:
-            existing_df = pd.DataFrame(columns=col_names)
-        merged = pd.concat([existing_df, new_rows_df.astype(str)]).drop_duplicates()
+            merged = new_clean
         ws.clear()
-        ws.update([merged.columns.tolist()] + merged.values.tolist())
+        data = merged.values.tolist()
+        if data:
+            ws.update(data)
     except Exception as e:
         st.error(f"Error saving to sheet: {e}")
 
@@ -587,7 +600,7 @@ elif page == "📁 Transactions":
                 try:
                     new_df = pd.read_csv(credit_upload, header=None,
                                          names=["date", "description", "debit", "credit", "card"])
-                    new_df = new_df.fillna("").astype(str)
+                    new_df = clean_for_sheets(new_df)
                     save_csv_to_sheet("credit", ["date","description","debit","credit","card"], new_df)
                     st.cache_data.clear()
                     st.success(f"✅ Credit card CSV uploaded — {len(new_df)} rows merged.")
@@ -603,7 +616,7 @@ elif page == "📁 Transactions":
                 try:
                     new_df = pd.read_csv(debit_upload, header=None,
                                           names=["date", "description", "debit", "credit"])
-                    new_df = new_df.fillna("").astype(str)
+                    new_df = clean_for_sheets(new_df)
                     save_csv_to_sheet("debit", ["date","description","debit","credit"], new_df)
                     st.cache_data.clear()
                     st.success(f"✅ Chequing CSV uploaded — {len(new_df)} rows merged.")
