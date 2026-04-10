@@ -3,6 +3,8 @@ import pandas as pd
 import json
 import os
 from datetime import datetime
+import gspread
+from google.oauth2.service_account import Credentials
 
 # ── PAGE CONFIG ───────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -29,13 +31,103 @@ def check_password():
 
 check_password()
 
-# ── FILE PATHS ─────────────────────────────────────────────────────────────────
-DATA_DIR = "data"
-CREDIT_CSV = os.path.join(DATA_DIR, "credit.csv")
-DEBIT_CSV = os.path.join(DATA_DIR, "debit.csv")
-LEARNED_FILE = os.path.join(DATA_DIR, "learned_merchants.json")
-CONFIRMED_FILE = os.path.join(DATA_DIR, "confirmed_transactions.json")
-BUDGET_FILE = os.path.join(DATA_DIR, "budget_settings.json")
+# ── GOOGLE SHEETS CONNECTION ──────────────────────────────────────────────────
+SHEET_ID = st.secrets["gcp_service_account"]["SHEET_ID"]
+
+@st.cache_resource
+def get_gsheet_client():
+    scopes = [
+        "https://www.googleapis.com/auth/spreadsheets",
+        "https://www.googleapis.com/auth/drive",
+    ]
+    # Build credentials from secrets (exclude SHEET_ID which is not a GCP field)
+    creds_dict = {k: v for k, v in st.secrets["gcp_service_account"].items() if k != "SHEET_ID"}
+    creds = Credentials.from_service_account_info(creds_dict, scopes=scopes)
+    return gspread.authorize(creds)
+
+def get_sheet(tab_name):
+    client = get_gsheet_client()
+    return client.open_by_key(SHEET_ID).worksheet(tab_name)
+
+# ── GOOGLE SHEETS DATA FUNCTIONS ──────────────────────────────────────────────
+
+def load_csv_from_sheet(tab_name, col_names):
+    """Load a sheet tab as a list of dicts."""
+    try:
+        ws = get_sheet(tab_name)
+        rows = ws.get_all_values()
+        if not rows:
+            return []
+        df = pd.DataFrame(rows, columns=col_names[:len(rows[0])])
+        return df.to_dict("records")
+    except Exception:
+        return []
+
+def save_csv_to_sheet(tab_name, col_names, new_rows_df):
+    """Merge new rows into a sheet tab, deduplicating."""
+    try:
+        ws = get_sheet(tab_name)
+        existing = ws.get_all_values()
+        if existing:
+            existing_df = pd.DataFrame(existing, columns=col_names[:len(existing[0])])
+        else:
+            existing_df = pd.DataFrame(columns=col_names)
+        merged = pd.concat([existing_df, new_rows_df.astype(str)]).drop_duplicates()
+        ws.clear()
+        ws.update([merged.columns.tolist()] + merged.values.tolist())
+    except Exception as e:
+        st.error(f"Error saving to sheet: {e}")
+
+def load_json_sheet(tab_name):
+    """Load key-value pairs from a sheet tab as a dict."""
+    try:
+        ws = get_sheet(tab_name)
+        rows = ws.get_all_values()
+        return {r[0]: r[1] for r in rows if len(r) >= 2}
+    except Exception:
+        return {}
+
+def save_json_sheet(tab_name, data):
+    """Save a dict to a sheet tab as key-value rows."""
+    try:
+        ws = get_sheet(tab_name)
+        ws.clear()
+        ws.update([[k, v] for k, v in data.items()])
+    except Exception as e:
+        st.error(f"Error saving to sheet: {e}")
+
+def load_confirmed_sheet():
+    """Load confirmed transactions from sheet."""
+    try:
+        ws = get_sheet("confirmed")
+        rows = ws.get_all_values()
+        result = {}
+        for r in rows:
+            if len(r) >= 6:
+                result[r[0]] = {
+                    "category": r[1],
+                    "date": r[2],
+                    "description": r[3],
+                    "amount": float(r[4]) if r[4] else 0,
+                    "account": r[5],
+                }
+        return result
+    except Exception:
+        return {}
+
+def save_confirmed_sheet(confirmed):
+    """Save confirmed transactions to sheet."""
+    try:
+        ws = get_sheet("confirmed")
+        ws.clear()
+        rows = []
+        for txn_id, v in confirmed.items():
+            rows.append([txn_id, v.get("category",""), v.get("date",""),
+                         v.get("description",""), str(v.get("amount",0)), v.get("account","")])
+        if rows:
+            ws.update(rows)
+    except Exception as e:
+        st.error(f"Error saving confirmed: {e}")
 
 # ── SPENDING CATEGORIES ────────────────────────────────────────────────────────
 SPENDING_CATEGORIES = [
@@ -130,14 +222,18 @@ INCOME_RULES = {
 # ── HELPER FUNCTIONS ───────────────────────────────────────────────────────────
 
 def load_json(filepath, default):
+    """Kept for local fallback — not used on cloud."""
     if os.path.exists(filepath):
         with open(filepath, "r") as f:
             return json.load(f)
     return default
 
 def save_json(filepath, data):
-    with open(filepath, "w") as f:
-        json.dump(data, f, indent=2)
+    """Kept for local fallback — not used on cloud."""
+    if filepath:
+        os.makedirs(os.path.dirname(filepath), exist_ok=True) if os.path.dirname(filepath) else None
+        with open(filepath, "w") as f:
+            json.dump(data, f, indent=2)
 
 def parse_date(date_str):
     for fmt in ("%m/%d/%Y", "%Y-%m-%d", "%d/%m/%Y", "%m-%d-%Y"):
@@ -284,11 +380,56 @@ def load_transactions():
 
     return transactions
 
-# ── LOAD STATE ─────────────────────────────────────────────────────────────────
-learned          = load_json(LEARNED_FILE, {})
-confirmed        = load_json(CONFIRMED_FILE, {})
-budget           = load_json(BUDGET_FILE, {})
-all_transactions = load_transactions()
+# ── LOAD STATE FROM GOOGLE SHEETS ─────────────────────────────────────────────
+@st.cache_data(ttl=30)
+def load_all_state():
+    learned   = load_json_sheet("learned")
+    confirmed = load_confirmed_sheet()
+    budget    = load_json_sheet("budget")
+    credit_rows = load_csv_from_sheet("credit", ["date","description","debit","credit","card"])
+    debit_rows  = load_csv_from_sheet("debit",  ["date","description","debit","credit"])
+    return learned, confirmed, budget, credit_rows, debit_rows
+
+learned, confirmed, budget, _credit_rows, _debit_rows = load_all_state()
+
+def load_transactions_from_rows(credit_rows, debit_rows):
+    transactions = []
+    for row in credit_rows:
+        desc = str(row.get("description","")).strip()
+        if is_credit_card_payment(desc):
+            continue
+        try:
+            amount_out = float(row.get("debit", 0) or 0)
+        except:
+            amount_out = 0
+        if amount_out > 0:
+            transactions.append(make_txn(row["date"], desc, amount_out, "Credit Card", "out"))
+        try:
+            amount_in = float(row.get("credit", 0) or 0)
+        except:
+            amount_in = 0
+        if amount_in > 0:
+            transactions.append(make_txn(row["date"], desc, amount_in, "Credit Card", "in"))
+
+    for row in debit_rows:
+        desc = str(row.get("description","")).strip()
+        if is_credit_card_payment(desc):
+            continue
+        try:
+            amount_out = float(row.get("debit", 0) or 0)
+        except:
+            amount_out = 0
+        if amount_out > 0:
+            transactions.append(make_txn(row["date"], desc, amount_out, "Chequing", "out"))
+        try:
+            amount_in = float(row.get("credit", 0) or 0)
+        except:
+            amount_in = 0
+        if amount_in > 0:
+            transactions.append(make_txn(row["date"], desc, amount_in, "Chequing", "in"))
+    return transactions
+
+all_transactions = load_transactions_from_rows(_credit_rows, _debit_rows)
 
 # ── CATEGORIZE ALL TRANSACTIONS ────────────────────────────────────────────────
 pending     = []
@@ -378,7 +519,7 @@ if page == "⚙️ Settings":
                 "✈️ Travel": travel, "🕌 Donations": donations,
                 "💈 Personal Care": personal_care, "🧺 Laundry": laundry, "❓ Other": other,
             }
-            save_json(BUDGET_FILE, budget)
+            save_json_sheet("budget", budget); st.cache_data.clear()
             st.success("✅ Settings saved!")
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -416,11 +557,11 @@ elif page == "⏳ Pending Review":
                         "amount": txn['amount'],
                         "account": txn['account']
                     }
-                    save_json(CONFIRMED_FILE, confirmed)
+                    save_confirmed_sheet(confirmed); st.cache_data.clear()
                     if remember:
                         merchant_name = txn['description'].split(" ")[0]
                         learned[merchant_name] = selected
-                        save_json(LEARNED_FILE, learned)
+                        save_json_sheet("learned", learned); st.cache_data.clear()
                         st.success("✅ Confirmed & learned!")
                     else:
                         st.success("✅ Confirmed!")
@@ -446,13 +587,9 @@ elif page == "📁 Transactions":
                 try:
                     new_df = pd.read_csv(credit_upload, header=None,
                                          names=["date", "description", "debit", "credit", "card"])
-                    if os.path.exists(CREDIT_CSV):
-                        existing_df = pd.read_csv(CREDIT_CSV, header=None,
-                                                   names=["date", "description", "debit", "credit", "card"])
-                        merged_df = pd.concat([existing_df, new_df]).drop_duplicates()
-                    else:
-                        merged_df = new_df
-                    merged_df.to_csv(CREDIT_CSV, index=False, header=False)
+                    new_df = new_df.fillna("").astype(str)
+                    save_csv_to_sheet("credit", ["date","description","debit","credit","card"], new_df)
+                    st.cache_data.clear()
                     st.success(f"✅ Credit card CSV uploaded — {len(new_df)} rows merged.")
                     st.rerun()
                 except Exception as e:
@@ -466,13 +603,9 @@ elif page == "📁 Transactions":
                 try:
                     new_df = pd.read_csv(debit_upload, header=None,
                                           names=["date", "description", "debit", "credit"])
-                    if os.path.exists(DEBIT_CSV):
-                        existing_df = pd.read_csv(DEBIT_CSV, header=None,
-                                                   names=["date", "description", "debit", "credit"])
-                        merged_df = pd.concat([existing_df, new_df]).drop_duplicates()
-                    else:
-                        merged_df = new_df
-                    merged_df.to_csv(DEBIT_CSV, index=False, header=False)
+                    new_df = new_df.fillna("").astype(str)
+                    save_csv_to_sheet("debit", ["date","description","debit","credit"], new_df)
+                    st.cache_data.clear()
                     st.success(f"✅ Chequing CSV uploaded — {len(new_df)} rows merged.")
                     st.rerun()
                 except Exception as e:
@@ -562,7 +695,7 @@ elif page == "📁 Transactions":
                             }
                             changed = True
                     if changed:
-                        save_json(CONFIRMED_FILE, confirmed)
+                        save_confirmed_sheet(confirmed); st.cache_data.clear()
 
                     total_in  = sum(t["amount"] for t in display if t["direction"] == "in")
                     total_out = sum(t["amount"] for t in display if t["direction"] == "out")
